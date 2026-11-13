@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/enterpilot/gomodel/internal/encryption"
@@ -68,6 +69,22 @@ func (s *sealedCredentialStore) Get(ctx context.Context, name string) (*ManagedP
 		return nil, err
 	}
 	return cred, nil
+}
+
+// UpdateSecret seals value the way a full save seals field, then writes only
+// that field of the existing row. The other secret fields are untouched, so a
+// key rotation that lands between the seal and the write cannot be confirmed
+// here: the next re-encryption pass reseals a value left on the old key.
+func (s *sealedCredentialStore) UpdateSecret(ctx context.Context, name, field, value string) error {
+	writer, ok := s.CredentialStore.(credentialSecretWriter)
+	if !ok {
+		return fmt.Errorf("credential store cannot update a secret in place")
+	}
+	sealed := value
+	if err := s.box.SealFields(credentialSecretKind, normalizeCredentialName(name), encryption.Field{Name: field, Value: &sealed}); err != nil {
+		return err
+	}
+	return writer.UpdateSecret(ctx, name, field, sealed)
 }
 
 func (s *sealedCredentialStore) Upsert(ctx context.Context, cred ManagedProviderCredential) error {

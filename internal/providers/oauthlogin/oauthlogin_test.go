@@ -11,6 +11,7 @@ package oauthlogin
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -355,6 +356,71 @@ func TestChatCompletion_RejectedRefreshRequiresReLogin(t *testing.T) {
 	}
 }
 
+// TestRefresh_FailedPersistStopsServingTokens: the authorization server has
+// already spent the refresh token by the time the rotated set is stored. A
+// persister that fails that write must not hand out the new access token — a
+// restart would reload the spent refresh token — and the session stays failed,
+// so a later call returns the same re-login error.
+func TestRefresh_FailedPersistStopsServingTokens(t *testing.T) {
+	for _, kind := range accountKinds {
+		t.Run(kind.name, func(t *testing.T) {
+			_, capture, cfg := startAuthServer(t, kind)
+			store := &memoryCredentialStore{failUpdate: errors.New("credential store unavailable")}
+			SetCredentialStore(store)
+			t.Cleanup(func() { SetCredentialStore(nil) })
+
+			provider := signedInProvider(t, cfg, "access-expired-"+kind.name, "refresh-"+kind.name, time.Now().Add(-time.Minute))
+
+			_, err := provider.ChatCompletion(context.Background(), chatRequest())
+			require.Error(t, err)
+			assert.ErrorContains(t, err, reLoginRequiredText)
+			assert.NotContains(t, requestPaths(capture), "/v1/chat/completions",
+				"the refreshed access token must not be served when its refresh token was not stored")
+
+			_, err = provider.ChatCompletion(context.Background(), chatRequest())
+			require.Error(t, err)
+			assert.ErrorContains(t, err, reLoginRequiredText)
+			assert.Equal(t, 1, countOn(capture, tokenPath(kind)),
+				"a failed persist ends the grant, so a later call must not spend the refresh token again")
+
+			stored := provider.session.current
+			assert.Empty(t, stored.AccessToken, "the unstored access token must be dropped")
+			assert.Equal(t, "refresh-"+kind.name, stored.RefreshToken)
+		})
+	}
+}
+
+// TestRefresh_SuccessfulPersistServesRotatedToken: a refresh whose persister
+// succeeds serves the rotated access token, and the stored session holds the
+// refresh token the authorization server rotated to.
+func TestRefresh_SuccessfulPersistServesRotatedToken(t *testing.T) {
+	for _, kind := range accountKinds {
+		t.Run(kind.name, func(t *testing.T) {
+			_, capture, cfg := startAuthServer(t, kind)
+			store := &memoryCredentialStore{}
+			SetCredentialStore(store)
+			t.Cleanup(func() { SetCredentialStore(nil) })
+
+			provider := signedInProvider(t, cfg, "access-expired-"+kind.name, "refresh-"+kind.name, time.Now().Add(-time.Minute))
+
+			resp, err := provider.ChatCompletion(context.Background(), chatRequest())
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+
+			sent := lastOn(t, capture, "/v1/chat/completions")
+			assert.Equal(t, "Bearer access-refreshed-"+kind.name, sent.Header.Get("Authorization"))
+
+			persisted, err := store.Get(context.Background(), cfg.Name)
+			require.NoError(t, err)
+			saved, err := parseSession(persisted.ServiceAccountJSON)
+			require.NoError(t, err)
+			assert.Equal(t, "access-refreshed-"+kind.name, saved.AccessToken)
+			assert.Equal(t, "refresh-rotated-"+kind.name, saved.RefreshToken,
+				"the stored session must hold the rotated refresh token")
+		})
+	}
+}
+
 // signedInProvider builds a provider that already holds a device-login session,
 // which is the state a completed login leaves behind.
 func signedInProvider(t *testing.T, cfg providers.ProviderConfig, access, refresh string, expiry time.Time) *Provider {
@@ -387,8 +453,9 @@ func waitForLogin(t *testing.T, provider *Provider) {
 // memoryCredentialStore is the credential store a test supplies. It keeps the
 // one row the provider persists its session into.
 type memoryCredentialStore struct {
-	mu  sync.Mutex
-	row *providers.ManagedProviderCredential
+	mu         sync.Mutex
+	row        *providers.ManagedProviderCredential
+	failUpdate error
 }
 
 func (s *memoryCredentialStore) Get(_ context.Context, name string) (*providers.ManagedProviderCredential, error) {
@@ -405,6 +472,23 @@ func (s *memoryCredentialStore) Upsert(_ context.Context, cred providers.Managed
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.row = &cred
+	return nil
+}
+
+// UpdateSecret replaces the one secret field a refresh writes and nothing else.
+// failUpdate makes the write fail, the way a credential store outage does.
+func (s *memoryCredentialStore) UpdateSecret(_ context.Context, name, field, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failUpdate != nil {
+		return s.failUpdate
+	}
+	if s.row == nil {
+		s.row = &providers.ManagedProviderCredential{Name: name, Type: providerType, Enabled: true}
+	}
+	if field == providers.CredentialFieldServiceAccountJSON {
+		s.row.ServiceAccountJSON = value
+	}
 	return nil
 }
 
@@ -433,6 +517,16 @@ func lastOn(t *testing.T, capture *providertest.Capture, path string) providerte
 		t.Fatalf("upstream received no %s request; paths: %v", path, requestPaths(capture))
 	}
 	return found
+}
+
+func countOn(capture *providertest.Capture, path string) int {
+	count := 0
+	for _, sent := range capture.All() {
+		if sent.Path == path {
+			count++
+		}
+	}
+	return count
 }
 
 func requestPaths(capture *providertest.Capture) []string {

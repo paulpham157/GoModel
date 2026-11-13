@@ -146,6 +146,25 @@ func (s *MongoDBCredentialStore) Delete(ctx context.Context, name string) error 
 	return nil
 }
 
+// UpdateSecret replaces one secret field of an existing credential document. No
+// other field changes, and a missing document is an error rather than an insert.
+func (s *MongoDBCredentialStore) UpdateSecret(ctx context.Context, name, field, value string) error {
+	column, ok := credentialSecretColumn(field)
+	if !ok {
+		return fmt.Errorf("unknown provider credential secret field %q", field)
+	}
+	result, err := s.collection.UpdateOne(ctx,
+		mongoCredentialIDFilter{ID: normalizeCredentialName(name)},
+		bson.M{"$set": bson.M{column: value}})
+	if err != nil {
+		return fmt.Errorf("update provider credential secret: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return ErrCredentialNotFound
+	}
+	return nil
+}
+
 // swapSecrets replaces a credential's secret fields only while they still
 // hold the values in current, and reports whether it did. Other fields are
 // left alone, so a concurrent edit to them is never lost either.

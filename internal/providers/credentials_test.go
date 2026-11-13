@@ -64,6 +64,25 @@ func (s *fakeCredentialStore) Delete(_ context.Context, name string) error {
 
 func (s *fakeCredentialStore) Close() error { return nil }
 
+// UpdateSecret replaces one secret field of an existing row. It is what a
+// provider calls to store a rotated secret without a full save.
+func (s *fakeCredentialStore) UpdateSecret(_ context.Context, name, field, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.rows[name]
+	if !ok {
+		return ErrCredentialNotFound
+	}
+	switch field {
+	case CredentialFieldServiceAccountJSON:
+		row.ServiceAccountJSON = value
+	default:
+		return errors.New("unknown provider credential secret field " + field)
+	}
+	s.rows[name] = row
+	return nil
+}
+
 func newCredentialsTestFactory(t *testing.T) *ProviderFactory {
 	t.Helper()
 	factory := NewProviderFactory()
@@ -152,6 +171,46 @@ func TestCredentialsService_UpsertRegistersAndRoutesImmediately(t *testing.T) {
 	stored, err := store.Get(ctx, "my-openai")
 	require.NoError(t, err)
 	assert.Equal(t, "test", stored.Type)
+}
+
+// TestCredentialsService_UpdateSecretKeepsTheRegisteredProvider: writing one
+// rotated secret back to its credential row must not rebuild the provider. The
+// instance the registry serves afterwards is the one it served before.
+// Upsert, by contrast, replaces that instance.
+func TestCredentialsService_UpdateSecretKeepsTheRegisteredProvider(t *testing.T) {
+	ctx := t.Context()
+	factory := newCredentialsTestFactory(t)
+	registry := NewModelRegistry()
+	store := newFakeCredentialStore()
+
+	svc, err := NewCredentialsService(ctx, factory, registry, store, nil, config.ResilienceConfig{}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Upsert(ctx, ManagedProviderCredential{
+		Name:    "rotating",
+		Type:    "test",
+		APIKeys: []string{"sk-test"},
+		Enabled: true,
+	}))
+	installed := registry.ProviderByName("rotating")
+	require.NotNil(t, installed)
+
+	require.NoError(t, svc.UpdateSecret(ctx, "rotating", CredentialFieldServiceAccountJSON, `{"refresh_token":"rotated"}`))
+
+	assert.Same(t, installed, registry.ProviderByName("rotating"),
+		"persisting a rotated secret must not replace the provider serving the request")
+	stored, err := store.Get(ctx, "rotating")
+	require.NoError(t, err)
+	assert.Equal(t, `{"refresh_token":"rotated"}`, stored.ServiceAccountJSON)
+
+	require.NoError(t, svc.Upsert(ctx, ManagedProviderCredential{
+		Name:    "rotating",
+		Type:    "test",
+		APIKeys: []string{"sk-replaced"},
+		Enabled: true,
+	}))
+	assert.NotSame(t, installed, registry.ProviderByName("rotating"),
+		"Upsert replaces the registered provider instance")
 }
 
 // TestCredentialsService_UpsertSucceedsWhenTheProviderRejectsTheKey covers the

@@ -193,9 +193,9 @@ func (p *Provider) StreamChatCompletion(ctx context.Context, req *core.ChatReque
 	return p.ChatCompatible.StreamChatCompletion(ctx, req)
 }
 
-// persist writes a rotated token set back to the credential store. A failure
-// is logged and swallowed by the session: the refreshed token is already in
-// memory, and the next refresh tries again.
+// persist writes a rotated token set back to the credential store. The error
+// is returned as well as logged: the session then refuses to serve the new
+// access token, because its refresh token was never stored.
 func (p *Provider) persist(ctx context.Context, providerName string, updated storedSession) error {
 	if err := persistSession(ctx, p.store, providerName, updated); err != nil {
 		slog.Warn("oauthlogin token refresh could not be stored", "provider", providerName, "error", err)

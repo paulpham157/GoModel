@@ -34,6 +34,13 @@ type credentialWriter interface {
 	Upsert(ctx context.Context, cred providers.ManagedProviderCredential) error
 }
 
+// sessionSecretWriter updates one sealed field of an existing credential row
+// and nothing else. A refresh uses it rather than Upsert, which rebuilds the
+// provider and would replace the instance serving the request.
+type sessionSecretWriter interface {
+	UpdateSecret(ctx context.Context, name, field, value string) error
+}
+
 // storedSession is the login state persisted inside the credential's secret
 // field. It is the only place tokens are written, and it is sealed at rest by
 // the credential store like every other provider secret.
@@ -59,6 +66,11 @@ type session struct {
 	// concurrent callers wait for one refresh instead of each spending the
 	// refresh token.
 	refreshing chan struct{}
+	// unstored is set when a refresh rotated the token but the rotated set
+	// could not be stored. The new refresh token then exists only in memory, so
+	// the session stops serving tokens: the next request fails with the
+	// re-login error instead of succeeding on a token a restart would lose.
+	unstored error
 }
 
 // sessionPersister stores a rotated token set. A nil persister keeps the
@@ -77,6 +89,10 @@ func newSession(initial storedSession, grant *grantClient, persister sessionPers
 // another credential: the caller is told a fresh login is required.
 func (s *session) accessToken(ctx context.Context) (string, error) {
 	s.mu.Lock()
+	if s.unstored != nil {
+		s.mu.Unlock()
+		return "", errLoginRequired
+	}
 	if token, ok := s.usable(); ok {
 		s.mu.Unlock()
 		return token, nil
@@ -101,6 +117,9 @@ func (s *session) accessToken(ctx context.Context) (string, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.unstored != nil {
+		return "", errLoginRequired
+	}
 	if token, ok := s.usable(); ok {
 		return token, nil
 	}
@@ -167,10 +186,19 @@ func (s *session) refresh(done chan struct{}) {
 		updated.TokenType = tokens.TokenType
 	}
 	updated.Expiry = expiryFrom(s.now(), tokens.ExpiresIn)
-	s.current = updated
 	if s.persister != nil {
-		_ = s.persister(context.Background(), updated)
+		if err := s.persister(context.Background(), updated); err != nil {
+			// The authorization server has already spent the refresh token.
+			// Serving the new access token would hide that its replacement
+			// was never stored, so the next restart reloads the spent one.
+			s.current.AccessToken = ""
+			s.current.Expiry = time.Time{}
+			s.unstored = err
+			return
+		}
 	}
+	s.current = updated
+	s.unstored = nil
 }
 
 // replace swaps the session for one a fresh login produced.
@@ -178,6 +206,7 @@ func (s *session) replace(next storedSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.current = next
+	s.unstored = nil
 }
 
 // expiryFrom converts a token response's expires_in into an absolute expiry.
@@ -212,21 +241,22 @@ func encodeSession(session storedSession) (string, error) {
 	return string(encoded), nil
 }
 
-// persistSession writes session into the provider credential's secret field,
-// preserving every other field of the stored row. The credential store seals
-// that field, so the tokens get the same encryption at rest as an API key.
+// persistSession writes session into the provider credential's secret field and
+// leaves every other field of the row untouched. The credential store seals
+// that field, so the tokens get the same encryption at rest as an API key. The
+// write updates the stored secret only: it does not rebuild the provider or
+// replace the instance that is serving the request.
 func persistSession(ctx context.Context, store credentialWriter, providerName string, session storedSession) error {
 	if store == nil || strings.TrimSpace(providerName) == "" {
 		return nil
 	}
-	row, err := store.Get(ctx, providerName)
-	if err != nil {
-		return err
+	writer, ok := store.(sessionSecretWriter)
+	if !ok {
+		return errors.New("oauthlogin credential store cannot update the stored session in place")
 	}
 	encoded, err := encodeSession(session)
 	if err != nil {
 		return err
 	}
-	row.ServiceAccountJSON = encoded
-	return store.Upsert(ctx, *row)
+	return writer.UpdateSecret(ctx, providerName, providers.CredentialFieldServiceAccountJSON, encoded)
 }

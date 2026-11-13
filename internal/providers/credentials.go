@@ -112,6 +112,14 @@ type CredentialStore interface {
 	Close() error
 }
 
+// credentialSecretWriter updates one secret field of an existing credential row
+// without touching anything else. It exists for a provider that rotates its own
+// stored secret while serving a request: the write must not rebuild or replace
+// the provider instance that is already handling it.
+type credentialSecretWriter interface {
+	UpdateSecret(ctx context.Context, name, field, value string) error
+}
+
 // CredentialsService merges declarative (config.yaml / env var) provider
 // names with the admin-managed credential store and reconciles the result
 // into the live factory/registry — the provider-credentials equivalent of
@@ -434,6 +442,31 @@ func (s *CredentialsService) List(ctx context.Context) ([]ManagedProviderCredent
 // Get returns one admin-managed credential row.
 func (s *CredentialsService) Get(ctx context.Context, name string) (*ManagedProviderCredential, error) {
 	return s.store.Get(ctx, name)
+}
+
+// UpdateSecret replaces one secret field of an existing credential row and
+// nothing else: the row is not rebuilt and the registered provider is not
+// replaced, so the instance already serving a request keeps running. The value
+// is sealed the same way a full save seals that field. A field that holds a
+// secret reference keeps holding one; the value it resolves to is what changes.
+func (s *CredentialsService) UpdateSecret(ctx context.Context, name, field, value string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return &CredentialFieldError{Field: "name", Message: "provider name is required"}
+	}
+	writer, ok := s.store.(credentialSecretWriter)
+	if !ok {
+		return fmt.Errorf("credential store cannot update a secret in place")
+	}
+	stored, err := s.secrets.StoreSecret(ctx, config.SecretKey{
+		Entity: CredentialSecretEntity,
+		ID:     name,
+		Field:  field,
+	}, value, nil)
+	if err != nil {
+		return err
+	}
+	return writer.UpdateSecret(ctx, name, field, stored)
 }
 
 // Upsert validates, persists, and hot-applies one admin-managed provider

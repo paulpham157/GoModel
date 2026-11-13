@@ -171,6 +171,40 @@ func (s *SQLCredentialStore) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
+// UpdateSecret replaces one secret column of an existing credential row. No
+// other column changes, and a missing row is an error rather than an insert.
+func (s *SQLCredentialStore) UpdateSecret(ctx context.Context, name, field, value string) error {
+	column, ok := credentialSecretColumn(field)
+	if !ok {
+		return fmt.Errorf("unknown provider credential secret field %q", field)
+	}
+	affected, err := s.db.Exec(ctx,
+		`UPDATE provider_credentials SET `+column+` = ? WHERE name = ?`,
+		value, normalizeCredentialName(name))
+	if err != nil {
+		return fmt.Errorf("update provider credential secret: %w", err)
+	}
+	if affected == 0 {
+		return ErrCredentialNotFound
+	}
+	return nil
+}
+
+// credentialSecretColumn maps a secret field name to its column. The set is
+// fixed, so the column name in the statement is never caller input.
+func credentialSecretColumn(field string) (string, bool) {
+	switch field {
+	case CredentialFieldServiceAccountJSON:
+		return "service_account_json", true
+	case CredentialFieldServiceAccountJSONBase64:
+		return "service_account_json_base64", true
+	case CredentialFieldProxyURL:
+		return "proxy_url", true
+	default:
+		return "", false
+	}
+}
+
 // swapSecrets replaces a credential's secret columns only while they still
 // hold the values in current, and reports whether it did. Other columns are
 // left alone, so a concurrent edit to them is never lost either.
